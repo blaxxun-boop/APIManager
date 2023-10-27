@@ -4,7 +4,9 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using BepInEx;
+using BepInEx.Configuration;
 using BepInEx.Preloader;
+using BepInEx.Preloader.Patching;
 using HarmonyLib;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
@@ -23,6 +25,10 @@ public static class Patcher
 	private static HashSet<string> redirectedNamespaces = null!;
 	private static readonly Assembly patchingAssembly = Assembly.GetExecutingAssembly();
 	private static string currentAssemblyPath = null!;
+
+	private static readonly ConfigEntry<bool> dumpAssemblies = (ConfigEntry<bool>)AccessTools.DeclaredField(typeof(AssemblyPatcher), "ConfigDumpAssemblies").GetValue(null);
+	private static readonly ConfigEntry<bool> loadDumpedAssemblies = (ConfigEntry<bool>)AccessTools.DeclaredField(typeof(AssemblyPatcher), "ConfigLoadDumpedAssemblies").GetValue(null);
+	private static readonly string dumpedAssembliesPath = (string)AccessTools.DeclaredField(typeof(AssemblyPatcher), "DumpedAssembliesPath").GetValue(null);
 
 	private static void GrabPluginInfo(PluginInfo __instance) => lastPluginInfo = __instance;
 
@@ -64,39 +70,68 @@ public static class Patcher
 		public void Dispose() { }
 	}
 
-	private static void InterceptAssemblyLoad(ref byte[] __0)
+	private class AssemblyLoadInterceptor
 	{
-		if (modifyNextLoad)
+		private static MethodInfo TargetMethod() => AccessTools.DeclaredMethod(typeof(Assembly), nameof(Assembly.Load), new[] { typeof(byte[]) });
+		private static string? assemblyPath = null;
+		
+		private static bool Prefix(ref byte[] __0, ref Assembly? __result)
 		{
-			modifyNextLoad = false;
-
-			try
+			assemblyPath = null;
+			if (modifyNextLoad)
 			{
-				using AssemblyDefinition assembly = AssemblyDefinition.ReadAssembly(new MemoryStream(__0), new ReaderParameters { AssemblyResolver = new MonoAssemblyResolver() });
+				modifyNextLoad = false;
 
-				((Dictionary<string, string>)typeof(EnvVars).Assembly.GetType("BepInEx.Preloader.RuntimeFixes.UnityPatches").GetProperty("AssemblyLocations")!.GetValue(null))[assembly.FullName] = currentAssemblyPath;
+				try
+				{
+					using AssemblyDefinition assembly = AssemblyDefinition.ReadAssembly(new MemoryStream(__0), new ReaderParameters { AssemblyResolver = new MonoAssemblyResolver() });
 
-				FixupModuleReferences(assembly.MainModule);
+					((Dictionary<string, string>)typeof(EnvVars).Assembly.GetType("BepInEx.Preloader.RuntimeFixes.UnityPatches").GetProperty("AssemblyLocations")!.GetValue(null))[assembly.FullName] = currentAssemblyPath;
 
-				using MemoryStream stream = new();
-				assembly.Write(stream);
-				__0 = stream.ToArray();
+					FixupModuleReferences(assembly.MainModule);
+
+					using MemoryStream stream = new();
+					assembly.Write(stream);
+					__0 = stream.ToArray();
+
+					string dumpedAssemblyPath = dumpedAssembliesPath + Path.DirectorySeparatorChar + assembly.Name.Name + ".dll";
+					if (loadDumpedAssemblies.Value || dumpAssemblies.Value)
+					{
+						File.WriteAllBytes(dumpedAssemblyPath, __0);
+					}
+
+					if (loadDumpedAssemblies.Value)
+					{
+						// skip main assembly load code
+						assemblyPath = dumpedAssemblyPath;
+						__result = null;
+						return false;
+					}
+				}
+				catch (BadImageFormatException)
+				{
+					// No chance, nothing we can do here
+				}
+				catch (Exception e)
+				{
+					Debug.LogError("Failed patching ... " + e);
+				}
 			}
-			catch (BadImageFormatException)
+
+			return true;
+		}
+
+		private static void Postfix(ref Assembly? __result)
+		{
+			if (assemblyPath is not null && __result == null /* successfully skipped */)
 			{
-				// No chance, nothing we can do here
-			}
-			catch (Exception e)
-			{
-				Debug.LogError("Failed patching ... " + e);
+				__result = Assembly.LoadFrom(assemblyPath);
 			}
 		}
 	}
 
 	private static void FixupModuleReferences(ModuleDefinition module)
 	{
-		HashSet<TypeReference> replacedTypeReferences = new();
-
 		TypeReference baseDeclaringType(TypeReference type)
 		{
 			while (type.DeclaringType is not null)
@@ -134,9 +169,9 @@ public static class Patcher
 			{
 				DispatchAttributes(parameter, referencingEntityName);
 
-				foreach (TypeReference? constraint in parameter.Constraints)
+				for (int i = 0; i < parameter.Constraints.Count; i++)
 				{
-					VisitType(constraint, referencingEntityName);
+					parameter.Constraints[i] = VisitType(parameter.Constraints[i], referencingEntityName);
 				}
 			}
 		}
@@ -180,7 +215,7 @@ public static class Patcher
 				return true;
 			}
 
-			if (replacedTypeReferences.Contains(baseDeclaringType(method.DeclaringType)) || (method.DeclaringType.Scope == module && redirectedNamespaces.Contains(baseDeclaringType(method.DeclaringType).Namespace)))
+			if (method.DeclaringType.Scope == module && redirectedNamespaces.Contains(baseDeclaringType(method.DeclaringType).Namespace))
 			{
 				if (method.Name == ".cctor")
 				{
@@ -219,7 +254,7 @@ public static class Patcher
 							GenericInstanceMethod genericImport = new(import);
 							for (int i = 0; i < generic.GenericArguments.Count; ++i)
 							{
-								VisitType(generic.GenericArguments[i], method.FullName);
+								generic.GenericArguments[i] = VisitType(generic.GenericArguments[i], method.FullName);
 								genericImport.GenericArguments.Add(generic.GenericArguments[i]);
 							}
 
@@ -236,7 +271,7 @@ public static class Patcher
 
 		FieldReference? importFieldReference(FieldReference field)
 		{
-			if (replacedTypeReferences.Contains(baseDeclaringType(field.DeclaringType)) || (field.DeclaringType.Scope == module && redirectedNamespaces.Contains(baseDeclaringType(field.DeclaringType).Namespace)))
+			if (field.DeclaringType.Scope == module && redirectedNamespaces.Contains(baseDeclaringType(field.DeclaringType).Namespace))
 			{
 				if (patchingAssembly.GetType(field.DeclaringType.FullName)?.GetField(field.Name, BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic) is { } fieldInfo)
 				{
@@ -249,13 +284,13 @@ public static class Patcher
 
 		void DispatchMethod(MethodDefinition method)
 		{
-			VisitType(method.ReturnType, method.FullName);
+			method.ReturnType = VisitType(method.ReturnType, method.FullName);
 			DispatchAttributes(method.MethodReturnType, method.FullName);
 			DispatchGenericParameters(method, method.FullName);
 
 			foreach (ParameterDefinition? parameter in method.Parameters)
 			{
-				VisitType(parameter.ParameterType, method.FullName);
+				parameter.ParameterType = VisitType(parameter.ParameterType, method.FullName);
 				DispatchAttributes(parameter, method.FullName);
 			}
 
@@ -281,7 +316,7 @@ public static class Patcher
 		{
 			foreach (VariableDefinition variable in body.Variables)
 			{
-				VisitType(variable.VariableType, body.Method.FullName);
+				variable.VariableType = VisitType(variable.VariableType, body.Method.FullName);
 			}
 
 			foreach (Instruction instruction in body.Instructions)
@@ -309,7 +344,7 @@ public static class Patcher
 						}
 						break;
 					case TypeReference type:
-						VisitType(type, body.Method.FullName);
+						instruction.Operand = VisitType(type, body.Method.FullName);
 						break;
 				}
 			}
@@ -317,9 +352,9 @@ public static class Patcher
 
 		void DispatchGenericArguments(IGenericInstance genericInstance, string referencingEntityName)
 		{
-			foreach (TypeReference? argument in genericInstance.GenericArguments)
+			for (int i = 0; i < genericInstance.GenericArguments.Count; i++)
 			{
-				VisitType(argument, referencingEntityName);
+				genericInstance.GenericArguments[i] = VisitType(genericInstance.GenericArguments[i], referencingEntityName);
 			}
 		}
 
@@ -327,7 +362,7 @@ public static class Patcher
 		{
 			foreach (InterfaceImplementation? iface in type.Interfaces)
 			{
-				VisitType(iface.InterfaceType, referencingEntityName);
+				iface.InterfaceType = VisitType(iface.InterfaceType, referencingEntityName);
 			}
 		}
 
@@ -335,7 +370,7 @@ public static class Patcher
 		{
 			foreach (EventDefinition? evt in type.Events)
 			{
-				VisitType(evt.EventType, referencingEntityName);
+				evt.EventType = VisitType(evt.EventType, referencingEntityName);
 				DispatchAttributes(evt, referencingEntityName);
 			}
 		}
@@ -344,7 +379,7 @@ public static class Patcher
 		{
 			foreach (PropertyDefinition? property in type.Properties)
 			{
-				VisitType(property.PropertyType, referencingEntityName);
+				property.PropertyType = VisitType(property.PropertyType, referencingEntityName);
 				DispatchAttributes(property, referencingEntityName);
 			}
 		}
@@ -353,7 +388,7 @@ public static class Patcher
 		{
 			foreach (FieldDefinition? field in type.Fields)
 			{
-				VisitType(field.FieldType, referencingEntityName);
+				field.FieldType = VisitType(field.FieldType, referencingEntityName);
 				DispatchAttributes(field, referencingEntityName);
 			}
 		}
@@ -376,27 +411,22 @@ public static class Patcher
 					VisitMethod(attribute.Constructor, referencingEntityName);
 				}
 
-				void DispatchCustomAttributeArgument(CustomAttributeArgument argument)
+				for (int i = 0; i < attribute.ConstructorArguments.Count; i++)
 				{
-					if (argument.Value is TypeReference nested)
-					{
-						VisitType(nested, referencingEntityName);
-					}
+					CustomAttributeArgument argument = attribute.ConstructorArguments[i];
+					attribute.ConstructorArguments[i] = new CustomAttributeArgument(VisitType(argument.Type, referencingEntityName), argument.Value);
 				}
 
-				foreach (CustomAttributeArgument argument in attribute.ConstructorArguments)
+				for (int i = 0; i < attribute.Properties.Count; i++)
 				{
-					DispatchCustomAttributeArgument(argument);
+					CustomAttributeNamedArgument namedArgument = attribute.Properties[i];
+					attribute.Properties[i] = new CustomAttributeNamedArgument(namedArgument.Name, new CustomAttributeArgument(VisitType(namedArgument.Argument.Type, referencingEntityName), namedArgument.Argument.Value));
 				}
 
-				foreach (CustomAttributeNamedArgument namedArgument in attribute.Properties)
+				for (int i = 0; i < attribute.Fields.Count; i++)
 				{
-					DispatchCustomAttributeArgument(namedArgument.Argument);
-				}
-
-				foreach (CustomAttributeNamedArgument namedArgument in attribute.Fields)
-				{
-					DispatchCustomAttributeArgument(namedArgument.Argument);
+					CustomAttributeNamedArgument namedArgument = attribute.Fields[i];
+					attribute.Fields[i] = new CustomAttributeNamedArgument(namedArgument.Name, new CustomAttributeArgument(VisitType(namedArgument.Argument.Type, referencingEntityName), namedArgument.Argument.Value));
 				}
 			}
 		}
@@ -413,14 +443,17 @@ public static class Patcher
 				DispatchGenericArguments(genericInstance, referencingEntityName);
 			}
 
-			VisitType(method.ReturnType, referencingEntityName);
+			method.ReturnType = VisitType(method.ReturnType, referencingEntityName);
 
 			foreach (ParameterDefinition? parameter in method.Parameters)
 			{
-				VisitType(parameter.ParameterType, referencingEntityName);
+				parameter.ParameterType = VisitType(parameter.ParameterType, referencingEntityName);
 			}
 
-			VisitType(method.DeclaringType, referencingEntityName);
+			if (method is not MethodSpecification)
+			{
+				method.DeclaringType = VisitType(method.DeclaringType, referencingEntityName);
+			}
 		}
 
 		void VisitField(FieldReference? field, string referencingEntityName)
@@ -430,20 +463,24 @@ public static class Patcher
 				return;
 			}
 
-			VisitType(field.FieldType, referencingEntityName);
-			VisitType(field.DeclaringType, referencingEntityName);
+			field.FieldType = VisitType(field.FieldType, referencingEntityName);
+
+			if (field is not FieldDefinition)
+			{
+				field.DeclaringType = VisitType(field.DeclaringType, referencingEntityName);
+			}
 		}
 
-		void VisitType(TypeReference? type, string referencingEntityName)
+		TypeReference? VisitType(TypeReference? type, string referencingEntityName)
 		{
 			if (type == null)
 			{
-				return;
+				return type;
 			}
 
 			if (type.GetElementType().IsGenericParameter)
 			{
-				return;
+				return type;
 			}
 
 			if (type is GenericInstanceType genericInstance)
@@ -451,32 +488,31 @@ public static class Patcher
 				DispatchGenericArguments(genericInstance, referencingEntityName);
 			}
 
-			FixupType(type);
+			return FixupType(type);
 		}
 
-		void FixupType(TypeReference type)
+		TypeReference FixupType(TypeReference type)
 		{
 			if (type.Scope == module && redirectedNamespaces.Contains(baseDeclaringType(type).Namespace))
 			{
 				if (type.IsNested)
 				{
-					FixupType(type.DeclaringType);
-					return;
+					return FixupType(type.DeclaringType);
 				}
 
 				if (patchingAssembly.GetType(type.FullName) is { } originalType)
 				{
-					TypeReference importedType = module.ImportReference(originalType);
-					type.Scope = importedType.Scope;
-					replacedTypeReferences.Add(baseDeclaringType(type));
+					return module.ImportReference(originalType);
 				}
 			}
+
+			return type;
 		}
 
 		//List<TypeDefinition> typesToRemove = new();
 		foreach (TypeDefinition type in module.GetTypes())
 		{
-			if (!redirectedNamespaces.Contains(baseDeclaringType(type).Namespace) || patchingAssembly.GetType(type.FullName) is null)
+			if (patchingAssembly.GetType(type.FullName) is null)
 			{
 				Dispatch(type);
 			}
@@ -505,7 +541,7 @@ public static class Patcher
 		harmony.Patch(AccessTools.DeclaredMethod(typeof(PluginInfo), nameof(PluginInfo.ToString)), prefix: new HarmonyMethod(AccessTools.DeclaredMethod(typeof(Patcher), nameof(GrabPluginInfo))));
 		harmony.Patch(AccessTools.DeclaredMethod(typeof(Assembly), nameof(Assembly.LoadFile), new[] { typeof(string) }), prefix: new HarmonyMethod(AccessTools.DeclaredMethod(typeof(Patcher), nameof(InterceptAssemblyLoadFile))));
 		harmony.Patch(AccessTools.DeclaredMethod(typeof(Assembly), nameof(Assembly.LoadFile), new[] { typeof(string) }), prefix: new HarmonyMethod(AccessTools.DeclaredMethod(typeof(Patcher), nameof(CheckAssemblyLoadFile))));
-		harmony.Patch(AccessTools.DeclaredMethod(typeof(Assembly), nameof(Assembly.Load), new[] { typeof(byte[]) }), prefix: new HarmonyMethod(AccessTools.DeclaredMethod(typeof(Patcher), nameof(InterceptAssemblyLoad))));
+		new PatchClassProcessor(harmony, typeof(AssemblyLoadInterceptor), true).Patch();
 
 		IEnumerable<TypeInfo> types;
 		try
