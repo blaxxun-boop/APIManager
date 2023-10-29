@@ -536,6 +536,8 @@ public static class Patcher
 		*/
 	}
 
+	public static bool PreventHarmonyInteropFixLoad(Assembly? __0) => __0 == null;
+
 	public static void Patch(IEnumerable<string>? extraNamespaces = null)
 	{
 		Harmony harmony = new("org.bepinex.plugins.APIManager");
@@ -543,6 +545,10 @@ public static class Patcher
 		harmony.Patch(AccessTools.DeclaredMethod(typeof(Assembly), nameof(Assembly.LoadFile), new[] { typeof(string) }), prefix: new HarmonyMethod(AccessTools.DeclaredMethod(typeof(Patcher), nameof(InterceptAssemblyLoadFile))));
 		harmony.Patch(AccessTools.DeclaredMethod(typeof(Assembly), nameof(Assembly.LoadFile), new[] { typeof(string) }), prefix: new HarmonyMethod(AccessTools.DeclaredMethod(typeof(Patcher), nameof(CheckAssemblyLoadFile))));
 		new PatchClassProcessor(harmony, typeof(AssemblyLoadInterceptor), true).Patch();
+		if (typeof(AssemblyPatcher).Assembly.GetType("BepInEx.Preloader.RuntimeFixes.HarmonyInteropFix") is { } interopFix)
+		{
+			harmony.Patch(AccessTools.DeclaredMethod(interopFix, "OnAssemblyLoad"), prefix: new HarmonyMethod(AccessTools.DeclaredMethod(typeof(Patcher), nameof(PreventHarmonyInteropFixLoad))));
+		}
 
 		IEnumerable<TypeInfo> types;
 		try
