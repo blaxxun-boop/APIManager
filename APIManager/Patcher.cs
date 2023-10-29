@@ -126,6 +126,7 @@ public static class Patcher
 			if (assemblyPath is not null && __result == null /* successfully skipped */)
 			{
 				__result = Assembly.LoadFrom(assemblyPath);
+				assemblyPath = null;
 			}
 		}
 	}
@@ -411,19 +412,19 @@ public static class Patcher
 					VisitMethod(attribute.Constructor, referencingEntityName);
 				}
 
-				for (int i = 0; i < attribute.ConstructorArguments.Count; i++)
+				for (int i = 0; i < attribute.ConstructorArguments.Count; ++i)
 				{
 					CustomAttributeArgument argument = attribute.ConstructorArguments[i];
 					attribute.ConstructorArguments[i] = new CustomAttributeArgument(VisitType(argument.Type, referencingEntityName), argument.Value);
 				}
 
-				for (int i = 0; i < attribute.Properties.Count; i++)
+				for (int i = 0; i < attribute.Properties.Count; ++i)
 				{
 					CustomAttributeNamedArgument namedArgument = attribute.Properties[i];
 					attribute.Properties[i] = new CustomAttributeNamedArgument(namedArgument.Name, new CustomAttributeArgument(VisitType(namedArgument.Argument.Type, referencingEntityName), namedArgument.Argument.Value));
 				}
 
-				for (int i = 0; i < attribute.Fields.Count; i++)
+				for (int i = 0; i < attribute.Fields.Count; ++i)
 				{
 					CustomAttributeNamedArgument namedArgument = attribute.Fields[i];
 					attribute.Fields[i] = new CustomAttributeNamedArgument(namedArgument.Name, new CustomAttributeArgument(VisitType(namedArgument.Argument.Type, referencingEntityName), namedArgument.Argument.Value));
