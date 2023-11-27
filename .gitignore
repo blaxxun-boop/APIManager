@@ -4,3 +4,4 @@ obj
 APIManager.sln.DotSettings.user
 .idea
 .vs
+Directory.Build.targets
