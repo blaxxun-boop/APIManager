@@ -74,7 +74,9 @@ public static class Patcher
 				}
 			}
 
-			__result = Assembly.Load(File.ReadAllBytes(__0));
+			string mdb = __0 + ".mdb";
+			__result = File.Exists(mdb) ? Assembly.Load(File.ReadAllBytes(__0), File.ReadAllBytes(mdb)) : Assembly.Load(File.ReadAllBytes(__0));
+			
 			return false;
 		}
 		return true;
